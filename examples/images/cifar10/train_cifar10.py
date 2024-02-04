@@ -5,6 +5,8 @@
 
 import copy
 import os
+import wandb
+
 
 import torch
 from absl import app, flags
@@ -28,7 +30,7 @@ FLAGS = flags.FLAGS
 flags.DEFINE_string("model", "otcfm", help="flow matching model type")
 flags.DEFINE_string("output_dir", "./results/", help="output_directory")
 # UNet
-flags.DEFINE_integer("num_channel", 128, help="base channel of UNet")
+flags.DEFINE_integer("num_channel", 32, help="base channel of UNet")
 
 # Training
 flags.DEFINE_float("lr", 2e-4, help="target learning rate")  # TRY 2e-4
@@ -37,7 +39,7 @@ flags.DEFINE_integer(
     "total_steps", 400001, help="total training steps"
 )  # Lipman et al uses 400k but double batch size
 flags.DEFINE_integer("warmup", 5000, help="learning rate warmup")
-flags.DEFINE_integer("batch_size", 128, help="batch size")  # Lipman et al uses 128
+flags.DEFINE_integer("batch_size", 512, help="batch size")  # Lipman et al uses 128
 flags.DEFINE_integer("num_workers", 4, help="workers of Dataloader")
 flags.DEFINE_float("ema_decay", 0.9999, help="ema decay rate")
 flags.DEFINE_bool("parallel", False, help="multi gpu training")
@@ -167,7 +169,9 @@ def train(argv):
 
     savedir = FLAGS.output_dir + FLAGS.model + "/"
     os.makedirs(savedir, exist_ok=True)
-
+    
+    wandb.init()
+    
     with trange(FLAGS.total_steps, dynamic_ncols=True) as pbar:
         for step in pbar:
             optim.zero_grad()
@@ -184,13 +188,19 @@ def train(argv):
             kl_div = torch.distributions.kl.kl_divergence(m, prior).mean()
         
             vt = net_model(t, xt, z)
-            loss = torch.mean((vt - ut) ** 2) + kl_div
+            cfm_loss = torch.mean((vt - ut) ** 2) 
+            loss = cfm_loss + kl_div
             loss.backward()
             torch.nn.utils.clip_grad_norm_(net_model.parameters(), FLAGS.grad_clip)  # new
             optim.step()
             sched.step()
             #ema(net_model, ema_model, FLAGS.ema_decay)  # new
 
+            wandb.log(
+                {"loss":loss.item(),
+                 "kl":kl_div.item(),
+                 "cfm_loss":cfm_loss.item()}
+            )
             # sample and Saving the weights
             """if FLAGS.save_step > 0 and step % FLAGS.save_step == 0:
                 generate_samples(net_model, FLAGS.parallel, savedir, step, net_="normal")
