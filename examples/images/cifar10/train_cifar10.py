@@ -9,6 +9,8 @@ import os
 import torch
 from absl import app, flags
 from torchdyn.core import NeuralODE
+from torch.distributions import Normal, Laplace
+from torchcfm.models.unet import UNetModelGuided,EncoderUNetModel
 from torchvision import datasets, transforms
 from tqdm import trange
 from utils_cifar import ema, generate_samples, infiniteloop
@@ -49,7 +51,7 @@ flags.DEFINE_integer(
 
 
 use_cuda = torch.cuda.is_available()
-device = torch.device("cuda" if use_cuda else "cpu")
+device = torch.device("cuda:0" if use_cuda else "cpu")
 
 
 def warmup_lr(step):
@@ -57,6 +59,8 @@ def warmup_lr(step):
 
 
 def train(argv):
+    
+    latent_dim = 32
     print(
         "lr, total_steps, ema decay, save_step:",
         FLAGS.lr,
@@ -101,16 +105,41 @@ def train(argv):
     ).to(
         device
     )  # new dropout + bs of 128
+    
+    net_model = UNetModelGuided(
+        dim=(3, 32, 32),
+        num_res_blocks=2,
+        num_channels=FLAGS.num_channel,
+        channel_mult=[1, 2, 2, 2],
+        num_heads=4,
+        num_head_channels=64,
+        attention_resolutions="16",
+        dropout=0.1, 
+        zdim=latent_dim, 
+        class_cond=True).to(device)
 
-    ema_model = copy.deepcopy(net_model)
-    optim = torch.optim.Adam(net_model.parameters(), lr=FLAGS.lr)
+    encoder_model = EncoderUNetModel(
+        image_size=32,
+        in_channels=3,
+        model_channels=FLAGS.num_channel,
+        out_channels=2*latent_dim,
+        num_res_blocks=2,
+        num_heads=4,
+        num_head_channels=64,
+        attention_resolutions=(32 // 16,),
+        dropout=0.1,
+        channel_mult=[1, 2, 2, 2]
+    ).to(device)
+    
+    #ema_model = copy.deepcopy(net_model)
+    optim = torch.optim.Adam(list(encoder_model.parameters()) + list(net_model.parameters()), lr=FLAGS.lr)
     sched = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda=warmup_lr)
     if FLAGS.parallel:
         print(
             "Warning: parallel training is performing slightly worse than single GPU training due to statistics computation in dataparallel. We recommend to train over a single GPU, which requires around 8 Gb of GPU memory."
         )
         net_model = torch.nn.DataParallel(net_model)
-        ema_model = torch.nn.DataParallel(ema_model)
+        #ema_model = torch.nn.DataParallel(ema_model)
 
     # show model size
     model_size = 0
@@ -145,28 +174,37 @@ def train(argv):
             x1 = next(datalooper).to(device)
             x0 = torch.randn_like(x1)
             t, xt, ut = FM.sample_location_and_conditional_flow(x0, x1)
-            vt = net_model(t, xt)
-            loss = torch.mean((vt - ut) ** 2)
+            
+            latent_dist = encoder_model(x1,t)
+            z_mu, z_logstd = latent_dist[:,:latent_dim], latent_dist[:,latent_dim:]
+            m = Normal(loc=z_mu,scale=z_logstd.exp())
+            z = m.rsample()
+            
+            prior = Normal(loc=torch.zeros_like(z_mu), scale=torch.ones_like(z_logstd))
+            kl_div = torch.distributions.kl.kl_divergence(m, prior).mean()
+        
+            vt = net_model(t, xt, z)
+            loss = torch.mean((vt - ut) ** 2) + kl_div
             loss.backward()
             torch.nn.utils.clip_grad_norm_(net_model.parameters(), FLAGS.grad_clip)  # new
             optim.step()
             sched.step()
-            ema(net_model, ema_model, FLAGS.ema_decay)  # new
+            #ema(net_model, ema_model, FLAGS.ema_decay)  # new
 
             # sample and Saving the weights
-            if FLAGS.save_step > 0 and step % FLAGS.save_step == 0:
+            """if FLAGS.save_step > 0 and step % FLAGS.save_step == 0:
                 generate_samples(net_model, FLAGS.parallel, savedir, step, net_="normal")
-                generate_samples(ema_model, FLAGS.parallel, savedir, step, net_="ema")
+                #generate_samples(ema_model, FLAGS.parallel, savedir, step, net_="ema")
                 torch.save(
                     {
                         "net_model": net_model.state_dict(),
-                        "ema_model": ema_model.state_dict(),
+                        #"ema_model": ema_model.state_dict(),
                         "sched": sched.state_dict(),
                         "optim": optim.state_dict(),
                         "step": step,
                     },
                     savedir + f"{FLAGS.model}_cifar10_weights_step_{step}.pt",
-                )
+                )"""
 
 
 if __name__ == "__main__":
